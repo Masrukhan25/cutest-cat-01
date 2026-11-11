@@ -3,148 +3,265 @@
 
 A program that draws one picture of a cat and writes it to /output/entry.png
 (or $MAKEFUN_OUTPUT_DIR/entry.png outside the grader). Deterministic: no
-randomness, no network, no time, no input. Pure Pillow drawing, so two runs
-write the same bytes.
+randomness, no network, no time, no input.
 
-The cat: a ginger kitten, sitting, head tilted, big bright eyes, pink nose,
-blush cheeks, whiskers, curled tail, and a pink yarn ball at its paw.
+Standard library only (no Pillow): a small software rasterizer draws the
+shapes into a byte buffer and a pure-Python PNG encoder (zlib) writes it.
+Two runs write the same bytes.
+
+The cat: a ginger kitten, sitting, head tilted 6 degrees, big bright eyes,
+pink nose, blush cheeks, whiskers, curled tail, and a pink yarn ball at
+its paw.
 """
+import math
 import os
-from PIL import Image, ImageDraw
+import struct
+import zlib
 
-S = 2  # supersample factor (draw at 2048, downscale to 1024 for smooth edges)
-W = 1024 * S
-H = 1024 * S
+W = 1024
+H = 1024
 
 # Palette (soft, warm, storybook)
 BG = (255, 243, 222)
-GINGER = (244, 164, 96)        # main fur
-GINGER_DARK = (232, 138, 68)   # shading / stripes
+GINGER = (244, 164, 96)
+GINGER_DARK = (232, 138, 68)
 GINGER_LIGHT = (255, 205, 150)
 CREAM = (255, 240, 214)
-PINK = (255, 150, 168)         # inner ear / nose / yarn
+PINK = (255, 150, 168)
 PINK_DARK = (235, 110, 135)
 BLUSH = (255, 140, 150)
-DARK = (74, 52, 42)            # outlines / eyes / nose line
+DARK = (74, 52, 42)
 EYE = (64, 42, 32)
 WHITE = (255, 255, 255)
 YARN = (255, 120, 150)
 YARN_DARK = (225, 80, 115)
+IRIS = (150, 95, 45)
+
+
+class Canvas:
+    """An RGB pixel buffer with a few filled-shape primitives."""
+
+    def __init__(self, w, h, bg):
+        self.w = w
+        self.h = h
+        self.buf = bytearray(bytes(bg) * (w * h))
+
+    def _span(self, y, x0, x1, color):
+        """Fill the horizontal span [x0, x1] on row y with color."""
+        if y < 0 or y >= self.h:
+            return
+        x0 = max(0, int(math.floor(x0)))
+        x1 = min(self.w - 1, int(math.ceil(x1)))
+        if x1 < x0:
+            return
+        n = x1 - x0 + 1
+        start = (y * self.w + x0) * 3
+        self.buf[start:start + n * 3] = bytes(color) * n
+
+    def _dot(self, x, y, color, r):
+        """A filled disc of radius r centred on (x, y)."""
+        self.fill_ellipse(x, y, r, r, color)
+
+    def fill_ellipse(self, cx, cy, rx, ry, color):
+        """Filled ellipse centred on (cx, cy) with radii rx, ry."""
+        rx = float(rx)
+        ry = float(ry)
+        if rx <= 0 or ry <= 0:
+            return
+        y0 = max(0, int(math.floor(cy - ry)))
+        y1 = min(self.h - 1, int(math.ceil(cy + ry)))
+        for y in range(y0, y1 + 1):
+            dy = (y - cy) / ry
+            if abs(dy) >= 1:
+                continue
+            dx = rx * math.sqrt(1 - dy * dy)
+            self._span(y, cx - dx, cx + dx, color)
+
+    def ellipse(self, cx, cy, rx, ry, fill, outline=None, width=1):
+        """Filled ellipse, optionally with an outline (drawn as a larger
+        ellipse underneath, which reads as a border of `width` px)."""
+        if outline is not None and width > 0:
+            self.fill_ellipse(cx, cy, rx + width, ry + width, outline)
+        if fill is not None:
+            self.fill_ellipse(cx, cy, rx, ry, fill)
+
+    def polygon(self, points, fill, outline=None):
+        """Filled polygon; an outline is drawn as lines along the edges."""
+        if fill is not None:
+            self._fill_polygon(points, fill)
+        if outline is not None:
+            n = len(points)
+            for i in range(n):
+                x0, y0 = points[i]
+                x1, y1 = points[(i + 1) % n]
+                self.line(x0, y0, x1, y1, outline, 3)
+
+    def _fill_polygon(self, points, color):
+        """Scanline fill of a polygon."""
+        ys = [p[1] for p in points]
+        y0 = max(0, int(math.floor(min(ys))))
+        y1 = min(self.h - 1, int(math.ceil(max(ys))))
+        n = len(points)
+        for y in range(y0, y1 + 1):
+            xs = []
+            for i in range(n):
+                x0, y0p = points[i]
+                x1, y1p = points[(i + 1) % n]
+                if (y0p <= y < y1p) or (y1p <= y < y0p):
+                    if y1p != y0p:
+                        xs.append(x0 + (y - y0p) * (x1 - x0) / (y1p - y0p))
+            xs.sort()
+            for i in range(0, len(xs) - 1, 2):
+                self._span(y, xs[i], xs[i + 1], color)
+
+    def line(self, x0, y0, x1, y1, color, width=1):
+        """A thick line: stepped discs along the segment."""
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = math.hypot(dx, dy)
+        steps = max(1, int(dist / max(1.0, width * 0.5)) + 1)
+        r = width / 2.0
+        for i in range(steps + 1):
+            t = i / steps
+            self._dot(x0 + dx * t, y0 + dy * t, color, r)
+
+    def arc(self, cx, cy, rx, ry, start_deg, end_deg, color, width=1):
+        """An arc (degrees, 0 = east, going clockwise as y grows)."""
+        a0 = math.radians(start_deg)
+        a1 = math.radians(end_deg)
+        if a1 <= a0:
+            a1 += 2 * math.pi
+        span = a1 - a0
+        steps = max(4, int(span * max(rx, ry) / max(1.0, width * 0.5)) + 1)
+        r = width / 2.0
+        for i in range(steps + 1):
+            a = a0 + span * i / steps
+            x = cx + rx * math.cos(a)
+            y = cy + ry * math.sin(a)
+            self._dot(x, y, color, r)
+
+    def save_png(self, path):
+        """Write the buffer as a 24-bit RGB PNG (filter 0, zlib)."""
+        raw = bytearray()
+        stride = self.w * 3
+        for y in range(self.h):
+            raw.append(0)
+            raw += self.buf[y * stride:(y + 1) * stride]
+        comp = zlib.compress(bytes(raw), 6)
+
+        def chunk(ctype, data):
+            c = struct.pack(">I", len(data)) + ctype + data
+            c += struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
+            return c
+
+        png = b"\x89PNG\r\n\x1a\n"
+        ihdr = struct.pack(">IIBBBBB", self.w, self.h, 8, 2, 0, 0, 0)
+        png += chunk(b"IHDR", ihdr)
+        png += chunk(b"IDAT", comp)
+        png += chunk(b"IEND", b"")
+        with open(path, "wb") as f:
+            f.write(png)
+
+
+def rot(x, y, cx, cy, deg):
+    """Rotate point (x, y) around (cx, cy) by deg degrees (clockwise as y grows)."""
+    a = math.radians(deg)
+    dx = x - cx
+    dy = y - cy
+    ca = math.cos(a)
+    sa = math.sin(a)
+    return (cx + dx * ca - dy * sa, cy + dx * sa + dy * ca)
 
 
 def main():
-    img = Image.new("RGB", (W, H), BG)
-    d = ImageDraw.Draw(img, "RGBA")
-
+    img = Canvas(W, H, BG)
     cx = W * 0.50  # cat centre x
 
     # ---- tail: a curled tube hugging the body's right side (behind the body) ----
-    # arc sweeping the right side (250 -> 0 -> 110); both ends tuck behind the body
-    tb = [cx + 110 * S, H * 0.62, cx + 250 * S, H * 0.90]
-    d.arc(tb, start=250, end=110, fill=GINGER_DARK, width=46 * S)
-    d.arc(tb, start=250, end=110, fill=GINGER, width=38 * S)
-    # cream tip: the top stretch of the same arc, same width, so it reads as one tail
-    d.arc(tb, start=250, end=292, fill=CREAM, width=38 * S)
-    # one tail stripe
-    d.arc(tb, start=330, end=20, fill=GINGER_DARK, width=6 * S)
+    tx, ty, trx, try_ = cx + 180, H * 0.76, 70, 140
+    img.arc(tx, ty, trx, try_, 250, 110, GINGER_DARK, 23)
+    img.arc(tx, ty, trx, try_, 250, 110, GINGER, 19)
+    img.arc(tx, ty, trx, try_, 250, 292, CREAM, 19)
+    img.arc(tx, ty, trx, try_, 330, 20, GINGER_DARK, 3)
 
     # ---- body: sitting, rounded, tall enough to meet the head ----
-    d.ellipse([cx - 178 * S, H * 0.52, cx + 178 * S, H * 0.90], fill=GINGER)
-    d.ellipse([cx - 178 * S, H * 0.52, cx + 178 * S, H * 0.90], outline=GINGER_DARK, width=4 * S)
+    img.ellipse(cx, H * 0.71, 178, 194, GINGER, GINGER_DARK, 2)
     # belly (cream)
-    d.ellipse([cx - 108 * S, H * 0.62, cx + 108 * S, H * 0.90], fill=CREAM)
+    img.ellipse(cx, H * 0.76, 108, 144, CREAM)
 
     # ---- front paws: two small paws together at the front ----
     for sx in (-1, 1):
-        px = cx + sx * 52 * S
-        d.ellipse([px - 42 * S, H * 0.82, px + 42 * S, H * 0.915], fill=GINGER)
-        d.ellipse([px - 42 * S, H * 0.82, px + 42 * S, H * 0.915], outline=GINGER_DARK, width=3 * S)
-        d.line([(px - 14 * S, H * 0.855), (px - 14 * S, H * 0.905)], fill=GINGER_DARK, width=3 * S)
-        d.line([(px + 14 * S, H * 0.855), (px + 14 * S, H * 0.905)], fill=GINGER_DARK, width=3 * S)
+        px = cx + sx * 52
+        img.ellipse(px, H * 0.8675, 42, 48, GINGER, GINGER_DARK, 2)
+        img.line(px - 14, H * 0.855, px - 14, H * 0.905, GINGER_DARK, 3)
+        img.line(px + 14, H * 0.855, px + 14, H * 0.905, GINGER_DARK, 3)
 
     # ---- yarn ball (favourite toy) at the left paw ----
-    yx, yy, yr = cx - 238 * S, H * 0.835, 60 * S
-    d.ellipse([yx - yr, yy - yr, yx + yr, yy + yr], fill=YARN)
-    d.ellipse([yx - yr, yy - yr, yx + yr, yy + yr], outline=YARN_DARK, width=4 * S)
-    d.arc([yx - yr, yy - yr, yx + yr, yy + yr], start=20, end=160, fill=YARN_DARK, width=5 * S)
-    d.arc([yx - yr * 0.7, yy - yr * 0.7, yx + yr * 0.7, yy + yr * 0.7], start=200, end=340, fill=YARN_DARK, width=5 * S)
-    d.arc([yx - yr * 0.45, yy - yr * 0.45, yx + yr * 0.45, yy + yr * 0.45], start=100, end=260, fill=YARN_DARK, width=4 * S)
+    yx, yy, yr = cx - 238, H * 0.835, 60
+    img.ellipse(yx, yy, yr, yr, YARN, YARN_DARK, 2)
+    img.arc(yx, yy, yr, yr, 20, 160, YARN_DARK, 5)
+    img.arc(yx, yy, yr * 0.7, yr * 0.7, 200, 340, YARN_DARK, 5)
+    img.arc(yx, yy, yr * 0.45, yr * 0.45, 100, 260, YARN_DARK, 4)
     # loose strand from the ball to the paw
-    d.arc([yx + 10 * S, yy - 20 * S, cx - 70 * S, yy + 60 * S], start=300, end=80, fill=YARN_DARK, width=5 * S)
+    img.arc((yx + 10 + cx - 70) / 2, yy + 20, (cx - 70 - yx - 10) / 2, 40, 300, 80, YARN_DARK, 5)
 
-    # ---- head: big and round, tilted slightly (charm), overlapping the body ----
-    head = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    hd = ImageDraw.Draw(head)
-    hx, hy = cx, H * 0.40  # head centre (lowered so it meets the body)
-    hr = 185 * S           # head radius
+    # ---- head: big and round, tilted 6 degrees, overlapping the body ----
+    hx, hy = cx, H * 0.40
+    hr = 185
+    TILT = 6.0
+
+    def R(x, y):
+        return rot(x, y, hx, hy, TILT)
 
     # ears (behind the head circle)
     for sx in (-1, 1):
-        ex = hx + sx * 118 * S
-        ey = hy - 128 * S
-        hd.polygon(
-            [(ex - 62 * S, ey + 78 * S), (ex + sx * 18 * S, ey - 62 * S), (ex + 78 * S, ey + 62 * S)],
-            fill=GINGER,
-        )
-        hd.polygon(
-            [(ex - 62 * S, ey + 78 * S), (ex + sx * 18 * S, ey - 62 * S), (ex + 78 * S, ey + 62 * S)],
-            outline=GINGER_DARK,
-        )
-        hd.polygon(
-            [(ex - 32 * S, ey + 58 * S), (ex + sx * 12 * S, ey - 28 * S), (ex + 44 * S, ey + 48 * S)],
-            fill=PINK,
-        )
+        ex = hx + sx * 118
+        ey = hy - 128
+        outer = [R(ex - 62, ey + 78), R(ex + sx * 18, ey - 62), R(ex + 78, ey + 62)]
+        img.polygon(outer, GINGER, GINGER_DARK)
+        inner = [R(ex - 32, ey + 58), R(ex + sx * 12, ey - 28), R(ex + 44, ey + 48)]
+        img.polygon(inner, PINK)
     # head circle
-    hd.ellipse([hx - hr, hy - hr, hx + hr, hy + hr], fill=GINGER)
-    hd.ellipse([hx - hr, hy - hr, hx + hr, hy + hr], outline=GINGER_DARK, width=5 * S)
+    img.ellipse(hx, hy, hr, hr, GINGER, GINGER_DARK, 3)
     # forehead stripes
     for sx in (-1, 0, 1):
-        hd.arc([hx + sx * 42 * S - 16 * S, hy - hr + 8 * S, hx + sx * 42 * S + 16 * S, hy - hr + 78 * S],
-               start=270, end=90, fill=GINGER_DARK, width=6 * S)
+        sxp, syp = R(hx + sx * 42, hy - hr + 43)
+        img.arc(sxp, syp, 16, 35, 270 + TILT, 90 + TILT, GINGER_DARK, 6)
     # muzzle (cream)
-    hd.ellipse([hx - 95 * S, hy + 28 * S, hx + 95 * S, hy + 128 * S], fill=CREAM)
+    mx, my = R(hx, hy + 78)
+    img.ellipse(mx, my, 95, 50, CREAM)
     # eyes: very large, bright, looking slightly up
     for sx in (-1, 1):
-        ex = hx + sx * 78 * S
-        ey = hy - 18 * S
-        er = 44 * S
-        hd.ellipse([ex - er, ey - er, ex + er, ey + er], fill=WHITE)
-        hd.ellipse([ex - er, ey - er, ex + er, ey + er], outline=DARK, width=4 * S)
-        ir = 30 * S
-        hd.ellipse([ex - ir, ey - ir + 4 * S, ex + ir, ey + ir + 4 * S], fill=(150, 95, 45))
-        pr = 16 * S
-        hd.ellipse([ex - pr, ey - pr + 4 * S, ex + pr, ey + pr + 4 * S], fill=EYE)
-        hd.ellipse([ex - 20 * S, ey - 26 * S, ex - 2 * S, ey - 8 * S], fill=WHITE)
-        hd.ellipse([ex + 8 * S, ey + 8 * S, ex + 18 * S, ey + 18 * S], fill=WHITE)
+        ex, ey = R(hx + sx * 78, hy - 18)
+        er = 44
+        img.ellipse(ex, ey, er, er, WHITE, DARK, 2)
+        img.ellipse(ex, ey + 4, 30, 30, IRIS)
+        img.ellipse(ex, ey + 4, 16, 16, EYE)
+        img.ellipse(ex - 11, ey - 17, 9, 9, WHITE)
+        img.ellipse(ex + 13, ey + 13, 5, 5, WHITE)
     # blush
     for sx in (-1, 1):
-        bx = hx + sx * 128 * S
-        by = hy + 52 * S
-        hd.ellipse([bx - 30 * S, by - 18 * S, bx + 30 * S, by + 18 * S], fill=BLUSH + (170,))
+        bx, by = R(hx + sx * 128, hy + 52)
+        img.ellipse(bx, by, 30, 18, BLUSH)
     # nose: small pink triangle
-    hd.polygon([(hx - 20 * S, hy + 48 * S), (hx + 20 * S, hy + 48 * S), (hx, hy + 72 * S)], fill=PINK)
-    hd.polygon([(hx - 20 * S, hy + 48 * S), (hx + 20 * S, hy + 48 * S), (hx, hy + 72 * S)], outline=PINK_DARK)
+    nose = [R(hx - 20, hy + 48), R(hx + 20, hy + 48), R(hx, hy + 72)]
+    img.polygon(nose, PINK, PINK_DARK)
     # mouth: tiny "w"
-    hd.arc([hx - 34 * S, hy + 66 * S, hx, hy + 104 * S], start=0, end=180, fill=DARK, width=4 * S)
-    hd.arc([hx, hy + 66 * S, hx + 34 * S, hy + 104 * S], start=0, end=180, fill=DARK, width=4 * S)
+    m1x, m1y = R(hx - 17, hy + 85)
+    img.arc(m1x, m1y, 17, 19, TILT, 180 + TILT, DARK, 4)
+    m2x, m2y = R(hx + 17, hy + 85)
+    img.arc(m2x, m2y, 17, 19, TILT, 180 + TILT, DARK, 4)
     # whiskers
     for sx in (-1, 1):
-        for wy, ang in ((hy + 30 * S, -8), (hy + 52 * S, 0), (hy + 74 * S, 8)):
-            x0 = hx + sx * 88 * S
-            x1 = hx + sx * 168 * S
-            y1 = wy + ang * S
-            hd.line([(x0, wy), (x1, y1)], fill=DARK + (200,), width=3 * S)
+        for wy, ang in ((hy + 30, -8), (hy + 52, 0), (hy + 74, 8)):
+            x0, y0 = R(hx + sx * 88, wy)
+            x1, y1 = R(hx + sx * 168, wy + ang)
+            img.line(x0, y0, x1, y1, DARK, 3)
 
-    # tilt the whole head a few degrees (head tilt = charm)
-    head = head.rotate(6, resample=Image.BICUBIC, center=(hx, hy))
-    img = Image.alpha_composite(img.convert("RGBA"), head).convert("RGB")
-
-    # ---- downscale to 1024 (smooth) and save ----
-    img = img.resize((1024, 1024), Image.LANCZOS)
     outdir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(outdir, exist_ok=True)
     out = os.path.join(outdir, "entry.png")
-    img.save(out, "PNG", optimize=True)
+    img.save_png(out)
     print(out)
 
 
